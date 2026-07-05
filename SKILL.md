@@ -1,19 +1,20 @@
 ---
 name: dsa-judge
-description: "Solve, verify, repair, or explain DSA problems with compile-validate-report pipeline."
+description: "Solve, verify, repair, or explain DSA problems with a robust compile-validate-repair pipeline."
 ---
 
 # DSA Judge
 
-Four modes. No guessing. No silent assumptions. Missing information → ask the user.
+A self-healing DSA problem solver. Compensates for LLM mistakes with
+deterministic verification at every stage.
 
 ## Modes
 
 | Mode | Required inputs | Pipeline does |
 |------|----------------|---------------|
-| **Solve** | problem, template, samples | Parse → Intake → Plan → Generate → Compile → Execute → Validate → Report |
-| **Verify** | problem, template, solution, samples | Parse → Intake → Compile → Execute → Validate → Report |
-| **Repair** | problem, template, failing code, samples | Parse → Intake → Compile → Diagnose → Fix → Recompile → Validate → Report |
+| **Solve** | problem, template, samples | Parse → Intake → Driver → Solution → Tests → Compile → Execute → Report |
+| **Verify** | problem, template, solution, samples | Parse → Intake → Compile → Execute → Report |
+| **Repair** | problem, template, failing code, samples | Parse → Intake → Compile → Diagnose → Fix → Recompile → Report |
 | **Explain** | problem, accepted code, samples | Parse → Intake → Plan → Explain approach and complexity |
 
 ## How to detect mode
@@ -23,281 +24,117 @@ Four modes. No guessing. No silent assumptions. Missing information → ask the 
 - Problem + code + "doesn't work" / "fails" / error output → **Repair**
 - Problem + code + "explain" / "how does this work" → **Explain**
 
-## Pipeline
+## How to use
 
-```
-Problem
-  │
-  ▼
-Parser
-  │
-  ▼
-Interactive Intake  ←── Asks for missing fields, never guesses
-  │
-  ▼
-Planner
-  │
-  ▼
-Generator / Reviewer
-  │
-  ▼
-Reviewer (pre-compile)
-  │
-  ▼
-Compiler
-  │
-  ▼
-Executor
-  │
-  ▼
-Validator
-  │
-  ▼
-Reporter
-```
-
-## Stage 1: Parse
-
-Extract from the problem text:
-- Title
-- Sample test cases (Input/Output pairs)
-- Constraints (ONLY if explicitly stated — never inferred)
-- Input/output format
-- Platform hints (with confidence score)
-- Function signature (if visible in text)
-
-Write to `ProblemSpec`.
-
-Platform detection returns a confidence score:
-```
-Platform: LeetCode (68% confidence, source: matched "class solution", "example 1:")
-```
-
-## Stage 2: Interactive Intake
-
-**This is a HARD GATE. The pipeline does not proceed until all fields are resolved.**
-
-Show the status table:
-```
-────────────────────────────────────
-  PROBLEM SPEC STATUS
-────────────────────────────────────
-
-  Required:
-    ✅ Description
-    ✅ Samples (2 provided)
-
-  Preferred:
-    ⚠️ Constraints
-    ❌ Code Template
-    ❌ Function Signature
-
-  Optional:
-    ⚠️ Existing Solution (missing)
-
-────────────────────────────────────
-  Gate: ✗ BLOCKED
-  Info: ⚠ INCOMPLETE
-────────────────────────────────────
-```
-
-If **BLOCKED** (required fields missing):
-```
-❌ BLOCKED — Missing required fields.
-
-Please provide:
-1. The problem statement (if missing)
-2. At least one sample test case (if missing)
-```
-
-If **INCOMPLETE** (preferred fields missing):
-```
-I need a few things before I can generate code.
-
-Reply with ONE of:
-
-1 — LeetCode (class Solution, function signature provided)
-2 — Codeforces (main function)
-3 — AtCoder (main function)
-4 — CSES (main function)
-5 — Paste custom template with function signature
-
-Also provide:
-- Constraints (if you have them)
-- Function name and signature
-```
-
-**NEVER:**
-- Infer the template
-- Guess the function name
-- Assume the entry point
-- Invent constraints
-
-## Stage 3: Plan
-
-Before writing code:
-1. What algorithm? (specific approach name)
-2. Why optimal? (justify against alternatives)
-3. Time complexity: O(...) — consistent, no contradictions
-4. Memory complexity: O(...)
-5. Edge cases: (list them)
-
-**Planner consistency rule:** If you say "single-pass", the code must be single-pass. If you say "two-pass", the code must be two-pass. Never say one thing and do another.
-
-If constraints are missing, note:
-```
-Planning performed without explicit constraints.
-Complexity estimate is approximate.
-Confidence: MEDIUM (constraints unknown)
-```
-
-## Stage 4: Generate
-
-Write C++20 solution using:
-- The exact function signature from the template
-- The exact class name from the template
-- The exact entry point from the template
-
-**Function name must match the problem/template.** If the problem says `maximumDigitRange`, the function must be called `maximumDigitRange`, not `sumOfDigits` or anything else.
-
-Rules:
-- Use `#include <bits/stdc++.h>` for competitive programming
-- Use `long long` when sum/product could overflow `int`
-- No unnecessary comments
-- No debug output
-- Handle all edge cases identified in Stage 3
-
-## Stage 5: Reviewer (Pre-Compile)
-
-Before compiling, check:
-- Integer overflow risk?
-- Off-by-one errors?
-- Function signature matches template?
-- Edge case handling?
-- Complexity matches plan (consistently)?
-
-If ANY issue found → fix before compiling.
-
-## Stage 6: Compile
+### Step 1: Run the runner
 
 ```bash
-g++ -std=c++20 -O2 -Wall -Wextra -o solution solution.cpp
+python3 runner.py --problem-file <path>
+python3 runner.py --problem "problem text"
+echo "problem text" | python3 runner.py --stdin
 ```
 
-If fails → analyze errors → fix → retry (max 5 attempts).
+### Step 2: Handle exit codes
 
-## Stage 7: Execute
+| Exit | Meaning | Action |
+|------|---------|--------|
+| `0` | Success | Read `workspace/<run_id>/report.md` for the answer |
+| `2` | Blocked intake | Read `workspace/<run_id>/gate.json` → ask user → write `gate_response.json` → re-run with `--resume <run_id>` |
+| `3` | Soft intake | Read `workspace/<run_id>/gate.json` → ask user → write `gate_response.json` → re-run with `--resume <run_id>` |
+| `4` | Compile failed | Read `workspace/<run_id>/compile_history.json` for errors |
+| `5` | Tests failed | Read `workspace/<run_id>/exec_history.json` for failures |
+| `6` | Parse failed | Ask user to rephrase the problem |
 
-Run against EVERY sample:
+### Step 3: Resume after intake
 
 ```bash
-echo "<input>" | ./solution
+# Write user answers to gate_response.json
+echo '{"template_choice": "1"}' > workspace/<run_id>/gate_response.json
+python3 runner.py --resume <run_id>
 ```
 
-## Stage 8: Validate
-
-Compare expected vs actual for each case. Show diffs on failure.
-
-## Stage 9: Report
+## Pipeline stages
 
 ```
-# DSA Judge Report
-
-## Mode: Solve
-
-## Requirement Check
-  Gate: OPEN
-  ✓ Description
-  ✓ Samples (2)
-  ✓ Constraints (explicit)
-  ✓ Template (LeetCode class Solution)
-  ✓ Function Signature (maximumDigitRange)
-
-## Compilation
-  ✅ 1 attempt, 0 warnings
-
-## Algorithm
-  <name and reasoning — consistent with code>
-
-## Complexity
-  Time: O(...)
-  Memory: O(...)
-
-## Sample Results
-  | # | Input | Expected | Actual | Status | Time |
-  |---|-------|----------|--------|--------|------|
-
-## Platform Confidence
-  LeetCode (68% confidence)
-  Source: matched "class solution", "example 1:"
-
-## Confidence: HIGH / MEDIUM / LOW
-## Weaknesses
-  - <concerns>
-
-## Final Verdict
-  ✅ / ❌
+Problem text
+  │
+  ▼
+Stage 1: PARSE        (LLM → ProblemSpecJSON)
+  │                    Validates JSON against pydantic schema
+  ▼
+Stage 2: INTAKE GATE  (deterministic)
+  │                    Checks required + preferred fields
+  │                    Blocks or asks user if missing
+  ▼
+Stage 3: DRIVER GEN   (LLM → driver.cpp)
+  │                    Generates main() harness for testing
+  │                    Syntax-checks driver+stub
+  ▼
+Stage 4: SOLUTION GEN (LLM → solution.cpp)
+  │                    Generates C++20 solution
+  │                    Validates function name, no debug, syntax
+  ▼
+Stage 5: EDGE TESTS   (deterministic categories + LLM cases)
+  │                    Generates overflow/null/boundary test cases
+  │                    Validates inputs against stated bounds
+  ▼
+Stage 6: COMPILE LOOP (deterministic + LLM repair)
+  │                    g++ compile → on error: classify → LLM fix → retry
+  │                    Max N attempts, signature check each iteration
+  ▼
+Stage 7: EXEC LOOP    (deterministic + LLM repair)
+  │                    Run all cases → on fail: diff → LLM fix → retry
+  │                    Regression gate: previously-passing must stay passing
+  ▼
+Final Report
 ```
 
-## Execute programmatically
+## Safety guarantees
 
-```python
-from pipeline.engine import parse_problem, run_pipeline
-from pipeline.state import ProblemSpec, Mode
+Every LLM output is re-checked:
 
-# Parse — extracts what it can, flags what's missing
-spec = parse_problem(problem_text)
-print(spec.status_table())
+| LLM emits | Deterministic check |
+|---|---|
+| ProblemSpecJSON | pydantic validation + bounds plausibility |
+| Driver C++ | syntax-only compile + correct function references |
+| Solution C++ | function name present + no debug/syscalls + syntax check |
+| Edge test inputs | respect stated min/max bounds |
+| Compile-repair patch | signature intact + no malicious calls + compiles |
+| Exec-repair patch | all previously-passing cases still pass + signature intact |
 
-# Check gate
-if spec.gate_status == "blocked":
-    # Show missing required fields, wait for user
-    for q in spec.questions_for_user:
-        print(q)
-elif spec.gate_status == "intake":
-    # Show missing preferred fields, wait for user
-    print(intake_summary(spec))
-    # After user responds, update spec and re-validate
-    spec = spec.updated(template="...", function_signature=...)
-    spec = validate_requirements(spec)
+## Exit codes
 
-# Agent does LLM work (plan, generate, verify)
-spec = spec.updated(
-    algorithm="...",
-    solution_cpp="...",
-    verification_passed=True,
-)
+- `0` — success
+- `2` — blocked intake (required fields missing)
+- `3` — soft intake (preferred fields missing)
+- `4` — compile failed after repair attempts
+- `5` — tests failed after repair attempts
+- `6` — parse failed (rephrase needed)
 
-# Run deterministic stages
-spec = run_pipeline(spec)
-print(spec.report_md)
+## Workspace layout
+
+```
+workspace/<run_id>/
+├── problem_spec.json       # Stage 1 output
+├── gate.json               # Stage 2 output
+├── gate_response.json      # User answers (written by agent)
+├── driver.cpp              # Stage 3
+├── driver.json             # Stage 3 metadata
+├── solution.cpp            # Stage 4 (current best)
+├── solution.json           # Stage 4 metadata
+├── tests.json              # Stage 5 plan
+├── tests/
+│   ├── <case_id>.in
+│   └── <case_id>.exp
+├── compile_history.json    # Stage 6 attempts
+├── binary                  # final binary
+├── exec_history.json       # Stage 7 attempts
+└── report.md               # final report
 ```
 
-## Confidence Scoring
+## Limitations
 
-Every inference gets a confidence score:
-
-| Source | Confidence |
-|--------|-----------|
-| Explicit in text | 1.0 |
-| Heuristic match | 0.6–0.8 |
-| Platform guess | 0.3–0.6 |
-| Pure guess | 0.0–0.3 |
-
-Report shows:
-```
-Platform: LeetCode (68% confidence)
-  Source: matched "class solution", "example 1:"
-
-Constraints: not provided
-  Planning will proceed without explicit constraints.
-  Confidence reduced.
-```
-
-## Limitations (V1)
-
-- Plain text problems only
 - C++20 only
-- Sample test cases only
-- No stress testing
+- Requires local g++ and POSIX (for resource limits)
+- Sample test cases only (no stress testing beyond generated edge cases)
 - No URL fetching

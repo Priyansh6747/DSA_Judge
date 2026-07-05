@@ -1,0 +1,17 @@
+Sum of Integers with Maximum Digit Range
+
+You are given an integer array nums.
+
+The digit range of an integer is defined as the difference between its largest digit and smallest digit.
+
+For example, the digit range of 5724 is 7 - 2 = 5.
+
+Return the sum of all integers in nums whose digit range is equal to the maximum digit range among all integers in the array.
+
+Example 1:
+Input: nums = [5724,111,350]
+Output: 6074
+
+Example 2:
+Input: nums = [90,900]
+Output: 990

@@ -1,308 +1,174 @@
-"""Pipeline engine — deterministic stages for DSA Judge.
+"""Pipeline engine — thin orchestrator for Stages 1-7.
 
-Handles: parse → validate requirements → compile → execute → validate output → report.
+Handles: parse → intake → driver → solution → test gen → compile → execute → report.
 
-The agent (LLM) handles: planning, code generation, verification, repair, explanation.
-These happen BETWEEN engine calls, guided by SKILL.md.
-
-Key principle: The engine NEVER guesses. If information is missing, it asks.
+The engine chains the new modules and persists intermediate JSON.
+LLM work happens inside each module; the engine just orchestrates.
 """
 
 from __future__ import annotations
 
-import re
-import subprocess
-import time
+import json
 from pathlib import Path
 from typing import Any
 
-from pipeline.state import ProblemSpec, Sample, Mode, Platform, Confidence, FunctionSignature, SolutionStatus
-from pipeline.validator import (
-    validate_requirements, can_proceed, is_blocked, needs_intake,
-    detect_platform, extract_function_signature, intake_summary,
-)
+from schemas.problem_spec import ProblemSpecJSON, RunState, Mode
+from schemas.repair_spec import GateResult
+from pipeline.parser import parse_problem, ParseError
+from pipeline.intake import classify, apply_user_response
+from pipeline.driver_gen import generate_driver, DriverGenError
+from pipeline.solution_gen import generate_solution, SolutionGenError
+from pipeline.test_gen import synthesize, TestGenError
+from pipeline.compiler import compile_with_repairs
+from pipeline.executor import execute_with_repairs
+from pipeline.reporter import build_report
 
 
-# ══════════════════════════════════════════════════════════════════
-# Parser
-# ══════════════════════════════════════════════════════════════════
+def run_pipeline(
+    spec: ProblemSpecJSON,
+    workspace: str = "workspace/runs",
+    max_compile_attempts: int = 5,
+    max_exec_attempts: int = 5,
+) -> RunState:
+    """Run the full pipeline: driver → solution → tests → compile → execute → report.
 
-def parse_problem(text: str) -> ProblemSpec:
-    """Parse problem text into a ProblemSpec.
-
-    Extracts what it can from the text. Missing fields are left empty —
-    the Requirement Validator will flag them and the Interactive Intake
-    will ask the user. Nothing is guessed.
+    Assumes spec is complete (gate status == "open").
+    Returns a RunState with all results populated.
     """
-    spec = ProblemSpec.new(text)
-
-    # Platform detection with confidence
-    platform, p_confidence, p_source = detect_platform(text)
-    spec = spec.updated(
-        platform=Confidence(platform, p_confidence, p_source),
-        platform_confidence=p_confidence,
-    )
-
-    lines = text.strip().split("\n")
-
-    # Title: first non-empty line that isn't a keyword
-    for line in lines:
-        stripped = line.strip()
-        if stripped and not any(kw in stripped.lower() for kw in [
-            "example", "input", "output", "sample", "constraint", "you are given"
-        ]):
-            spec = spec.updated(title=stripped)
-            break
-
-    # Constraints — look for explicit numeric ranges ONLY
-    # Do NOT infer from platform or problem type
-    constraints = {}
-    for pattern, key in [
-        (r"(\d+)\s*[≤<=]\s*(\w+)\s*[≤<=]\s*(\d+)", "range"),
-        (r"time limit[:\s]*(\d+)", "time_limit"),
-        (r"memory limit[:\s]*(\d+)", "memory_limit"),
-        (r"(\d+)\s*<=?\s*n\s*<=?\s*(\d+)", "n_range"),
-        (r"(\d+)\s*<=?\s*nums\[i\]\s*<=?\s*(\d+)", "nums_range"),
-    ]:
-        match = re.search(pattern, text, re.I)
-        if match:
-            constraints[key] = match.groups()
-    if constraints:
-        spec = spec.updated(
-            constraints=constraints,
-            constraint_confidence=1.0,
-        )
-
-    # Samples — find "Sample Input N:" / "Sample Output N:" pairs
-    samples = []
-    sample_pattern = re.compile(
-        r"[Ss]ample\s+[Ii]nput\s*(\d+)\s*[:\n]\s*(.*?)[\n]+[Ss]ample\s+[Oo]utput\s*\1\s*[:\n]\s*(.*?)(?=\n[Ss]ample|\Z)",
-        re.S,
-    )
-    for m in sample_pattern.finditer(text):
-        inp = m.group(2).strip()
-        out = m.group(3).strip()
-        if inp and out:
-            samples.append(Sample(
-                case_id=m.group(1).zfill(2),
-                input=inp,
-                expected=out,
-            ))
-
-    # Fallback: unnumbered Input:/Output: pairs
-    if not samples:
-        unnumbered = re.compile(
-            r"[Ii]nput\s*[:\n]\s*(.*?)[\n]+[Oo]utput\s*[:\n]\s*(.*?)(?=\n[Ii]nput|\n[Ee]xample|\Z)",
-            re.S,
-        )
-        for i, m in enumerate(unnumbered.finditer(text)):
-            inp = m.group(1).strip()
-            out = m.group(2).strip()
-            if inp and out:
-                samples.append(Sample(
-                    case_id=f"{i+1:02d}",
-                    input=inp,
-                    expected=out,
-                ))
-
-    if samples:
-        spec = spec.updated(samples=tuple(samples))
-
-    # Input/output format sections
-    input_format = _extract_section(text, ["input format", "input"])
-    output_format = _extract_section(text, ["output format", "output"])
-    if input_format:
-        spec = spec.updated(input_format=input_format)
-    if output_format:
-        spec = spec.updated(output_format=output_format)
-
-    # Try to extract function signature from the problem text
-    name, ret_type, args, cls = extract_function_signature(text)
-    if name:
-        spec = spec.updated(
-            function_signature=FunctionSignature(name, ret_type, args, cls),
-            template_confidence=0.8,
-        )
-
-    # Validate requirements (sets gate_status)
-    spec = validate_requirements(spec)
-
-    return spec
-
-
-def _extract_section(text: str, headers: list[str]) -> str:
-    for header in headers:
-        pattern = rf"(?:^|\n)(?:{header})\s*[:\n](.*?)(?:\n(?:input|output|sample|constraint|note|example)|\Z)"
-        match = re.search(pattern, text, re.I | re.S)
-        if match:
-            return match.group(1).strip()
-    return ""
-
-
-# ══════════════════════════════════════════════════════════════════
-# Compiler
-# ══════════════════════════════════════════════════════════════════
-
-def compile_cpp(source_path: str, binary_path: str) -> dict[str, Any]:
-    cmd = ["g++", "-std=c++20", "-O2", "-Wall", "-Wextra", "-o", binary_path, source_path]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    warnings = [l for l in result.stderr.splitlines() if "warning:" in l.lower()]
-    errors = [l for l in result.stderr.splitlines() if "error:" in l.lower()]
-    return {
-        "success": result.returncode == 0,
-        "binary_path": binary_path if result.returncode == 0 else "",
-        "warnings": warnings,
-        "errors": errors,
-    }
-
-
-# ══════════════════════════════════════════════════════════════════
-# Executor
-# ══════════════════════════════════════════════════════════════════
-
-def execute_binary(binary_path: str, stdin: str, timeout_s: float = 5.0, memory_limit_mb: int = 256) -> dict[str, Any]:
-    import resource
-
-    def set_limits():
-        mem_bytes = memory_limit_mb * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        resource.setrlimit(resource.RLIMIT_CPU, (int(timeout_s) + 1, int(timeout_s) + 1))
-
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(
-            [binary_path], input=stdin, capture_output=True, text=True,
-            timeout=timeout_s, preexec_fn=set_limits,
-        )
-        elapsed_ms = (time.monotonic() - t0) * 1000
-        try:
-            mem_kb = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-        except Exception:
-            mem_kb = 0
-        return {
-            "stdout": proc.stdout, "stderr": proc.stderr,
-            "exit_code": proc.returncode, "timed_out": False,
-            "time_ms": elapsed_ms, "memory_kb": mem_kb,
-        }
-    except subprocess.TimeoutExpired:
-        elapsed_ms = (time.monotonic() - t0) * 1000
-        return {
-            "stdout": "", "stderr": f"Timed out after {timeout_s}s",
-            "exit_code": -1, "timed_out": True,
-            "time_ms": elapsed_ms, "memory_kb": 0,
-        }
-
-
-# ══════════════════════════════════════════════════════════════════
-# Output Validator
-# ══════════════════════════════════════════════════════════════════
-
-def validate_output(expected: str, actual: str) -> dict[str, Any]:
-    exp = expected.strip().rstrip("\n")
-    act = actual.strip().rstrip("\n")
-    passed = exp == act
-    diff = ""
-    if not passed:
-        exp_lines = exp.split("\n")
-        act_lines = act.split("\n")
-        parts = []
-        for i in range(max(len(exp_lines), len(act_lines))):
-            e = exp_lines[i] if i < len(exp_lines) else "<missing>"
-            a = act_lines[i] if i < len(act_lines) else "<missing>"
-            if e != a:
-                parts.append(f"  Line {i+1}:")
-                parts.append(f"    - expected: {e}")
-                parts.append(f"    + actual:   {a}")
-        diff = "\n".join(parts)
-    return {"passed": passed, "diff": diff}
-
-
-# ══════════════════════════════════════════════════════════════════
-# Full Pipeline Runner (deterministic stages only)
-# ══════════════════════════════════════════════════════════════════
-
-def run_pipeline(spec: ProblemSpec, workspace: str = "workspace/runs") -> ProblemSpec:
-    """Run compile → execute → validate.
-
-    Assumes spec.solution_cpp is already populated by the agent.
-    Gate must be open before calling this.
-    """
-    if is_blocked(spec):
-        raise ValueError("Cannot run pipeline: gate is blocked. Missing required fields.")
-    if needs_intake(spec):
-        raise ValueError("Cannot run pipeline: intake required. Missing preferred fields.")
-
     run_dir = Path(workspace) / spec.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write solution
-    source_path = str(run_dir / "solution.cpp")
-    binary_path = str(run_dir / "solution")
-    Path(source_path).write_text(spec.solution_cpp)
-
-    # Compile
-    cr = compile_cpp(source_path, binary_path)
-    spec = spec.updated(
-        compiled=cr["success"],
-        binary_path=cr["binary_path"],
-        compiler_warnings=tuple(cr["warnings"]),
-        compiler_errors=tuple(cr["errors"]),
-        compile_attempts=spec.compile_attempts + 1,
+    # Persist problem spec
+    (run_dir / "problem_spec.json").write_text(
+        json.dumps(spec.model_dump(), indent=2, default=str)
     )
 
-    if not cr["success"]:
-        return spec
+    state = RunState(spec=spec, run_dir=run_dir, run_id=spec.run_id)
 
-    # Execute
-    case_results = []
-    for sample in spec.samples:
-        case_dir = run_dir / "cases"
-        case_dir.mkdir(exist_ok=True)
-        (case_dir / f"{sample.case_id}.stdin").write_text(sample.input)
-        (case_dir / f"{sample.case_id}.expected").write_text(sample.expected)
-
-        er = execute_binary(spec.binary_path, sample.input)
-        (case_dir / f"{sample.case_id}.actual").write_text(er["stdout"])
-
-        case_results.append({
-            "case_id": sample.case_id,
-            "actual": er["stdout"],
-            "passed": False,
-            "time_ms": er["time_ms"],
-            "memory_kb": er["memory_kb"],
-            "error": er["stderr"] if er["exit_code"] != 0 else "",
+    # ── Stage 3: Driver Generation ──
+    try:
+        driver_artifact = generate_driver(spec, run_dir)
+        state = state.model_copy(update={
+            "driver_cpp": driver_artifact.driver_cpp,
+            "driver_is_self_contained": driver_artifact.is_self_contained,
+        })
+        if driver_artifact.driver_cpp:
+            (run_dir / "driver.cpp").write_text(driver_artifact.driver_cpp)
+        (run_dir / "driver.json").write_text(
+            json.dumps(driver_artifact.model_dump(), indent=2)
+        )
+    except DriverGenError as e:
+        state = state.model_copy(update={
+            "known_weaknesses": state.known_weaknesses + (f"Driver generation failed: {e}",),
         })
 
-    spec = spec.updated(case_results=tuple(case_results))
+    # ── Stage 5: Edge Test Generation (before solution, to get edge cases) ──
+    try:
+        test_plan = synthesize(spec, run_dir)
+        state = state.model_copy(update={
+            "test_plan_cases": tuple(tc.model_dump() for tc in test_plan.cases),
+            "brute_force_cpp": test_plan.brute_force_cpp,
+        })
+        (run_dir / "tests.json").write_text(
+            json.dumps(test_plan.model_dump(), indent=2, default=str)
+        )
+        # Write test files
+        tests_dir = run_dir / "tests"
+        tests_dir.mkdir(exist_ok=True)
+        for tc in test_plan.cases:
+            (tests_dir / f"{tc.id}.in").write_text(tc.input)
+            if tc.expected:
+                (tests_dir / f"{tc.id}.exp").write_text(tc.expected)
+    except TestGenError as e:
+        state = state.model_copy(update={
+            "known_weaknesses": state.known_weaknesses + (f"Test generation failed: {e}",),
+        })
 
-    # Validate
-    passed = 0
-    failed = 0
-    diffs = []
-    validated = []
+    # ── Stage 4: Solution Generation ──
+    edge_cases = tuple(
+        tc.get("why", "") for tc in state.test_plan_cases if tc.get("why")
+    )
+    try:
+        solution_artifact = generate_solution(spec, edge_cases, run_dir)
+        state = state.model_copy(update={
+            "solution_cpp": solution_artifact.solution_cpp,
+            "algorithm": solution_artifact.algorithm,
+            "complexity_time": solution_artifact.complexity_time,
+            "complexity_memory": solution_artifact.complexity_memory,
+            "edge_cases": solution_artifact.edge_cases_addressed,
+        })
+        (run_dir / "solution.cpp").write_text(solution_artifact.solution_cpp)
+        (run_dir / "solution.json").write_text(
+            json.dumps(solution_artifact.model_dump(), indent=2)
+        )
+    except SolutionGenError as e:
+        state = state.model_copy(update={
+            "known_weaknesses": state.known_weaknesses + (f"Solution generation failed: {e}",),
+        })
+        return state
 
-    for cr_item in spec.case_results:
-        expected = next((s.expected for s in spec.samples if s.case_id == cr_item["case_id"]), "")
-        vr = validate_output(expected, cr_item["actual"])
-
-        if vr["passed"]:
-            passed += 1
-        else:
-            failed += 1
-            diffs.append({
-                "case_id": cr_item["case_id"],
-                "expected": expected,
-                "actual": cr_item["actual"],
-                "diff": vr["diff"],
-            })
-
-        validated.append({**cr_item, "passed": vr["passed"]})
-
-    spec = spec.updated(
-        case_results=tuple(validated),
-        passed_samples=passed,
-        failed_samples=failed,
-        diffs=tuple(diffs),
+    # ── Stage 6: Compile ──
+    compile_result = compile_with_repairs(
+        spec=spec,
+        solution_cpp=state.solution_cpp or "",
+        driver_cpp=state.driver_cpp or "",
+        run_dir=run_dir,
+        max_attempts=max_compile_attempts,
+        func_name=spec.function_signature.name,
+        class_name=spec.function_signature.class_name,
+    )
+    state = state.model_copy(update={
+        "compiled": compile_result.success,
+        "binary_path": compile_result.binary_path,
+        "compile_history": (compile_result.model_dump(),),
+    })
+    (run_dir / "compile_history.json").write_text(
+        json.dumps(compile_result.model_dump(), indent=2, default=str)
     )
 
-    return spec
+    if not compile_result.success:
+        return state
+
+    # ── Stage 7: Execute + Validate + Repair ──
+    # Combine sample cases and edge test cases
+    all_cases = []
+    for s in spec.samples:
+        all_cases.append({
+            "id": s.id,
+            "input": s.input,
+            "expected": s.expected,
+            "category": "sample",
+        })
+    for tc in state.test_plan_cases:
+        if tc.get("expected"):  # Only include cases with expected output
+            all_cases.append(tc)
+
+    exec_result = execute_with_repairs(
+        spec=spec,
+        binary_path=state.binary_path,
+        test_cases=all_cases,
+        driver_cpp=state.driver_cpp or "",
+        run_dir=run_dir,
+        max_attempts=max_exec_attempts,
+    )
+
+    state = state.model_copy(update={
+        "case_results": tuple(cr.model_dump() for cr in exec_result.case_results),
+        "passed_samples": exec_result.passed,
+        "failed_samples": exec_result.failed,
+        "exec_history": (exec_result.model_dump(),),
+    })
+    (run_dir / "exec_history.json").write_text(
+        json.dumps(exec_result.model_dump(), indent=2, default=str)
+    )
+
+    # ── Build Report ──
+    report = build_report(state)
+    state = state.model_copy(update={
+        "report_md": report.report_md,
+        "confidence": report.confidence,
+        "known_weaknesses": state.known_weaknesses + tuple(report.known_weaknesses),
+    })
+    (run_dir / "report.md").write_text(report.report_md)
+
+    return state

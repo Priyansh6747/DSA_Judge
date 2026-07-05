@@ -1,0 +1,10 @@
+A. Watermelon
+
+Input: one integer w (1 ≤ w ≤ 100)
+Output: "YES" if w can be divided into two even parts, "NO" otherwise
+
+Sample Input:
+8
+
+Sample Output:
+YES

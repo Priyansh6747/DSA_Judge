@@ -1,0 +1,17 @@
+Repetitions
+
+You are given a DNA sequence consisting of characters A, C, G, and T.
+Find the length of the longest repetition in the sequence.
+A repetition is a substring consisting of identical characters.
+
+Input:
+The first line contains a string s (1 ≤ |s| ≤ 10^6) consisting of characters A, C, G, and T.
+
+Output:
+Print one integer — the length of the longest repetition.
+
+Sample Input:
+ATTCGGGA
+
+Sample Output:
+3
