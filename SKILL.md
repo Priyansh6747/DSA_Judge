@@ -1,140 +1,163 @@
 ---
 name: dsa-judge
-description: "Solve, verify, repair, or explain DSA problems with a robust compile-validate-repair pipeline."
+description: "Deterministic C++ compile/execute tooling for agent-orchestrated DSA solving."
 ---
 
 # DSA Judge
 
-A self-healing DSA problem solver. Compensates for LLM mistakes with
-deterministic verification at every stage.
+Deterministic tooling for DSA problem solving. The agent (LLM) handles all
+reasoning — parsing, code generation, repair. This skill provides only
+deterministic operations: compile, execute, diff, report.
 
-## Modes
+## Architecture
 
-| Mode | Required inputs | Pipeline does |
-|------|----------------|---------------|
-| **Solve** | problem, template, samples | Parse → Intake → Driver → Solution → Tests → Compile → Execute → Report |
-| **Verify** | problem, template, solution, samples | Parse → Intake → Compile → Execute → Report |
-| **Repair** | problem, template, failing code, samples | Parse → Intake → Compile → Diagnose → Fix → Recompile → Report |
-| **Explain** | problem, accepted code, samples | Parse → Intake → Plan → Explain approach and complexity |
+```
+Agent (Finrel)                    Deterministic Pipeline
+─────────────                     ─────────────────────
+Parse problem text         →      ProblemSpecJSON (schema)
+Generate solution.cpp      →      source code (text)
+Generate driver.cpp        →      test harness (text)
+Generate test cases        →      test cases (JSON)
+                                   │
+                                   ▼
+                              compile(source, driver)
+                                   │
+                                   ▼
+                              execute(binary, tests)
+                                   │
+                                   ▼
+                              report(results)
+```
 
-## How to detect mode
+**The agent does the thinking. The pipeline does the verifying.**
 
-- Problem only → **Solve**
-- Problem + code snippet → **Verify**
-- Problem + code + "doesn't work" / "fails" / error output → **Repair**
-- Problem + code + "explain" / "how does this work" → **Explain**
+## CLI Usage
 
-## How to use
-
-### Step 1: Run the runner
+### Compile
 
 ```bash
-python3 runner.py --problem-file <path>
-python3 runner.py --problem "problem text"
-echo "problem text" | python3 runner.py --stdin
+python3 runner.py compile --source solution.cpp --driver driver.cpp --out-dir workspace/run1
+python3 runner.py compile --source solution.cpp --func-name solve --out-dir workspace/run1
 ```
 
-### Step 2: Handle exit codes
+Output: JSON with `success`, `binary_path`, `errors`, `warnings`
 
-| Exit | Meaning | Action |
-|------|---------|--------|
-| `0` | Success | Read `workspace/<run_id>/report.md` for the answer |
-| `2` | Blocked intake | Read `workspace/<run_id>/gate.json` → ask user → write `gate_response.json` → re-run with `--resume <run_id>` |
-| `3` | Soft intake | Read `workspace/<run_id>/gate.json` → ask user → write `gate_response.json` → re-run with `--resume <run_id>` |
-| `4` | Compile failed | Read `workspace/<run_id>/compile_history.json` for errors |
-| `5` | Tests failed | Read `workspace/<run_id>/exec_history.json` for failures |
-| `6` | Parse failed | Ask user to rephrase the problem |
-
-### Step 3: Resume after intake
+### Execute
 
 ```bash
-# Write user answers to gate_response.json
-echo '{"template_choice": "1"}' > workspace/<run_id>/gate_response.json
-python3 runner.py --resume <run_id>
+# From file
+python3 runner.py execute --binary workspace/run1/solution --tests tests.json
+
+# From stdin
+echo '[{"id":"t1","input":"1 2","expected":"3"}]' | python3 runner.py execute --binary workspace/run1/solution --stdin
 ```
 
-## Pipeline stages
+Output: JSON with `success`, `case_results`, `passed`, `failed`, `failures`
 
-```
-Problem text
-  │
-  ▼
-Stage 1: PARSE        (LLM → ProblemSpecJSON)
-  │                    Validates JSON against pydantic schema
-  ▼
-Stage 2: INTAKE GATE  (deterministic)
-  │                    Checks required + preferred fields
-  │                    Blocks or asks user if missing
-  ▼
-Stage 3: DRIVER GEN   (LLM → driver.cpp)
-  │                    Generates main() harness for testing
-  │                    Syntax-checks driver+stub
-  ▼
-Stage 4: SOLUTION GEN (LLM → solution.cpp)
-  │                    Generates C++20 solution
-  │                    Validates function name, no debug, syntax
-  ▼
-Stage 5: EDGE TESTS   (deterministic categories + LLM cases)
-  │                    Generates overflow/null/boundary test cases
-  │                    Validates inputs against stated bounds
-  ▼
-Stage 6: COMPILE LOOP (deterministic + LLM repair)
-  │                    g++ compile → on error: classify → LLM fix → retry
-  │                    Max N attempts, signature check each iteration
-  ▼
-Stage 7: EXEC LOOP    (deterministic + LLM repair)
-  │                    Run all cases → on fail: diff → LLM fix → retry
-  │                    Regression gate: previously-passing must stay passing
-  ▼
-Final Report
+### Run (compile + execute)
+
+```bash
+python3 runner.py run --source solution.cpp --driver driver.cpp --tests tests.json --out-dir workspace/run1
 ```
 
-## Safety guarantees
+## Exit Codes
 
-Every LLM output is re-checked:
+| Code | Meaning |
+|------|---------|
+| 0 | Success (compilation OK or all tests passed) |
+| 1 | Compilation failed |
+| 2 | One or more tests failed (wrong answer) |
+| 3 | Runtime error / TLE |
 
-| LLM emits | Deterministic check |
-|---|---|
-| ProblemSpecJSON | pydantic validation + bounds plausibility |
-| Driver C++ | syntax-only compile + correct function references |
-| Solution C++ | function name present + no debug/syscalls + syntax check |
-| Edge test inputs | respect stated min/max bounds |
-| Compile-repair patch | signature intact + no malicious calls + compiles |
-| Exec-repair patch | all previously-passing cases still pass + signature intact |
+## Test Case Format
 
-## Exit codes
+```json
+[
+  {"id": "t1", "input": "2 7 11 15\n9", "expected": "0 1"},
+  {"id": "t2", "input": "3 3\n6", "expected": "0 1"}
+]
+```
 
-- `0` — success
-- `2` — blocked intake (required fields missing)
-- `3` — soft intake (preferred fields missing)
-- `4` — compile failed after repair attempts
-- `5` — tests failed after repair attempts
-- `6` — parse failed (rephrase needed)
+Fields: `id` (required), `input` (required), `expected` (required), `category` (optional)
 
-## Workspace layout
+## How to Solve a Problem
+
+1. **Parse** the problem text — extract title, description, constraints, samples, function signature
+2. **Generate** a C++ solution with `#include <bits/stdc++.h>`, matching the function signature exactly
+3. **Generate** a test harness driver (main function that reads input, calls solution, prints output)
+4. **Compile**: `python3 runner.py compile --source solution.cpp --driver driver.cpp --func-name <name> --out-dir workspace/<run_id>`
+5. **If compile fails**: read the errors from JSON output, fix the code, retry (max 3-5 attempts)
+6. **Execute**: `python3 runner.py execute --binary workspace/<run_id>/solution --tests tests.json`
+7. **If tests fail**: read the failure diffs, fix the solution, recompile, re-execute
+8. **Report**: summarize results with algorithm, complexity, and edge cases
+
+## Compile Repair Loop (Agent-Orchestrated)
+
+```
+generate solution.cpp
+  → compile --source solution.cpp --func-name solve
+  → if failed:
+      read errors from JSON
+      fix code (address each error)
+      retry compile (max 5 attempts)
+  → if func_name missing:
+      fix: ensure function signature matches exactly
+```
+
+## Execute Repair Loop (Agent-Orchestrated)
+
+```
+execute --binary solution --tests tests.json
+  → if wrong_answer:
+      read failure.diff for each failing case
+      fix algorithm / edge cases
+      recompile + re-execute
+  → if TLE:
+      optimize algorithm
+      recompile + re-execute
+  → if RTE/sigsegv:
+      check for off-by-one, null deref, overflow
+      fix + recompile + re-execute
+  → regression gate: previously-passing cases must still pass
+```
+
+## Safety Guarantees
+
+| Check | How |
+|-------|-----|
+| Function name matches | post-compile: `func_name in source` |
+| No malicious calls | `has_malicious_calls()` — blocks system(), fopen(), curl |
+| No debug output | agent must not emit cout << "DEBUG" |
+| Test inputs respect bounds | agent generates within stated constraints |
+| Regression gate | agent tracks previously-passing cases across repair iterations |
+
+## Schemas (for agent use)
+
+Import from `schemas/`:
+
+```python
+from schemas.problem_spec import ProblemSpecJSON, Sample, Constraints, ConstraintBound, FunctionSignature
+from schemas.repair_spec import CompileResult, ExecResult, CaseVerdict, FailureClassification
+from schemas.test_spec import TestCase, TestPlan
+from schemas.report_spec import ReportJSON
+```
+
+## Workspace Layout
 
 ```
 workspace/<run_id>/
-├── problem_spec.json       # Stage 1 output
-├── gate.json               # Stage 2 output
-├── gate_response.json      # User answers (written by agent)
-├── driver.cpp              # Stage 3
-├── driver.json             # Stage 3 metadata
-├── solution.cpp            # Stage 4 (current best)
-├── solution.json           # Stage 4 metadata
-├── tests.json              # Stage 5 plan
-├── tests/
-│   ├── <case_id>.in
-│   └── <case_id>.exp
-├── compile_history.json    # Stage 6 attempts
-├── binary                  # final binary
-├── exec_history.json       # Stage 7 attempts
-└── report.md               # final report
+├── solution.cpp          # agent-generated solution
+├── driver.cpp            # agent-generated test harness
+├── solution              # compiled binary
+├── tests.json            # test cases
+├── compile.json          # compile result (from runner output)
+├── execute.json          # execute result (from runner output)
+└── report.md             # final report (agent-built)
 ```
 
 ## Limitations
 
 - C++20 only
-- Requires local g++ and POSIX (for resource limits)
-- Sample test cases only (no stress testing beyond generated edge cases)
-- No URL fetching
+- Requires g++ and POSIX (for resource limits on execution)
+- Agent handles all reasoning — this skill is just the deterministic tooling
+- No URL fetching, no stress testing beyond generated edge cases

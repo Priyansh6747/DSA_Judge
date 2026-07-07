@@ -1,7 +1,7 @@
-"""Test compiler error classification and compile loop."""
+"""Test compiler error classification and compile function."""
 
 import pytest
-from pipeline.compiler import classify_compiler_errors, _classify_error_kind, _has_malicious_calls
+from pipeline.compiler import classify_compiler_errors, _classify_error_kind, has_malicious_calls
 
 
 def test_classify_syntax_error():
@@ -75,16 +75,16 @@ def test_error_kind_linker():
 
 
 def test_malicious_system():
-    assert _has_malicious_calls('system("rm -rf /")') is True
+    assert has_malicious_calls('system("rm -rf /")') is True
 
 
 def test_malicious_fopen():
-    assert _has_malicious_calls('fopen("/etc/passwd", "r")') is True
+    assert has_malicious_calls('fopen("/etc/passwd", "r")') is True
 
 
 def test_malicious_clean():
-    assert _has_malicious_calls('int solve(vector<int>& nums) { return 0; }') is False
+    assert has_malicious_calls('int solve(vector<int>& nums) { return 0; }') is False
 
 
 def test_malicious_include_curl():
-    assert _has_malicious_calls('#include <curl/curl.h>') is True
+    assert has_malicious_calls('#include <curl/curl.h>') is True
